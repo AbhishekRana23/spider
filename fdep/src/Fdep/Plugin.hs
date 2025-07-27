@@ -456,7 +456,7 @@ waitForAllModules expectedTotal = do
             print $ "All " <> show expectedTotal <> " modules completed!"
             return ()
         else do
-            threadDelay 200000  -- Wait 200ms
+            threadDelay 1000000  -- Wait 1000ms
             waitForAllModules expectedTotal
 
 processModule :: CliOptions -> ModSummary -> TcGblEnv -> IO ()

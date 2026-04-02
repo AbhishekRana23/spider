@@ -36,6 +36,14 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
+#if __GLASGOW_HASKELL__ >= 906
+import GHC.Types.Unique.FM (emptyUFM)
+import GHC.Driver.Plugins (ParsedResult(..))
+import qualified Data.List.NonEmpty as NE
+import GHC.Hs.DocString (renderHsDocString)
+import GHC.Hs.Doc (WithHsDocIdentifiers(..))
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+#endif
 #else
 import CoreMonad (CoreM, CoreToDo (CoreDoPluginPass), liftIO)
 import CoreSyn (
@@ -104,7 +112,13 @@ plugin :: Plugin
 plugin = (defaultPlugin{
             -- installCoreToDos = install
         pluginRecompile = (\_ -> return NoForceRecompile)
+#if __GLASGOW_HASKELL__ >= 906
+        , parsedResultAction = \opts modSummary pr -> do
+            _ <- collectTypeInfoParser opts modSummary (parsedResultModule pr)
+            pure pr
+#else
         , parsedResultAction = collectTypeInfoParser
+#endif
         , typeCheckResultAction = collectTypesTC
         })
 
@@ -125,7 +139,23 @@ instance Semigroup Plugin where
           (Nothing, Nothing) -> Nothing
           (Just tp, Nothing) -> Just tp
           (Nothing, Just tq) -> Just tq
-          (Just (TcPlugin tcPluginInit1 tcPluginSolve1 tcPluginStop1), Just (TcPlugin tcPluginInit2 tcPluginSolve2 tcPluginStop2)) -> Just $ TcPlugin 
+#if __GLASGOW_HASKELL__ >= 906
+          (Just (TcPlugin tcPluginInit1 tcPluginSolve1 _ tcPluginStop1), Just (TcPlugin tcPluginInit2 tcPluginSolve2 _ tcPluginStop2)) -> Just $ TcPlugin
+            { tcPluginInit = do
+                ip <- tcPluginInit1
+                iq <- tcPluginInit2
+                return (ip, iq)
+            , tcPluginSolve = \(sp,sq) evBindsVar given wanted -> do
+                solveP <- tcPluginSolve1 sp evBindsVar given wanted
+                solveQ <- tcPluginSolve2 sq evBindsVar given wanted
+                return $ combineTcPluginResults solveP solveQ
+            , tcPluginRewrite = \_ -> emptyUFM
+            , tcPluginStop = \(solveP,solveQ) -> do
+                tcPluginStop1 solveP
+                tcPluginStop2 solveQ
+            }
+#else
+          (Just (TcPlugin tcPluginInit1 tcPluginSolve1 tcPluginStop1), Just (TcPlugin tcPluginInit2 tcPluginSolve2 tcPluginStop2)) -> Just $ TcPlugin
             { tcPluginInit = do
                 ip <- tcPluginInit1
                 iq <- tcPluginInit2
@@ -138,9 +168,14 @@ instance Semigroup Plugin where
                 tcPluginStop1 solveP
                 tcPluginStop2 solveQ
             }
+#endif
     }
 
+#if __GLASGOW_HASKELL__ >= 906
+combineTcPluginResults :: TcPluginSolveResult -> TcPluginSolveResult -> TcPluginSolveResult
+#else
 combineTcPluginResults :: TcPluginResult -> TcPluginResult -> TcPluginResult
+#endif
 combineTcPluginResults resP resQ =
   case (resP, resQ) of
     (TcPluginContradiction ctsP, TcPluginContradiction ctsQ) ->
@@ -214,15 +249,19 @@ getTypeInfo modName (L _ decl) = case decl of
         [(showSDocUnsafe' lname, TypeInfo
             { name = showSDocUnsafe' lname
             , typeKind = "data"
+#if __GLASGOW_HASKELL__ >= 906
+            , dataConstructors = map (getDataConInfo modName) (Prelude.foldr (:) [] (dd_cons defn))
+#else
             , dataConstructors = map (getDataConInfo modName) (dd_cons defn)
+#endif
             })]
     TyClD _ (SynDecl _ lname _ _ rhs) ->
         [(showSDocUnsafe' lname, TypeInfo
             { name = showSDocUnsafe' lname
             , typeKind = "type"
-            , dataConstructors = [DataConInfo 
-                (showSDocUnsafe' lname) 
-                (Map.singleton "synonym" (StructuredTypeRep (pack $ showSDocUnsafe $ ppr $ unLoc rhs) (parseTypeToComplexType $ unLoc rhs))) 
+            , dataConstructors = [DataConInfo
+                (showSDocUnsafe' lname)
+                (Map.singleton "synonym" (StructuredTypeRep (pack $ showSDocUnsafe $ ppr $ unLoc rhs) (parseTypeToComplexType $ unLoc rhs)))
                 []]
             })]
 #elif __GLASGOW_HASKELL__ >= 810
@@ -275,7 +314,11 @@ getDataConInfo modName (L _ decl) = case decl of
             }
     ConDeclGADT{con_names = lnames, con_res_ty = ty} ->
         DataConInfo
+#if __GLASGOW_HASKELL__ >= 906
+            { dataConNames = intercalate ", " (map showSDocUnsafe' (NE.toList lnames))
+#else
             { dataConNames = intercalate ", " (map showSDocUnsafe' lnames)
+#endif
             , fields = Map.singleton "gadt" (StructuredTypeRep (pack $ showSDocUnsafe $ ppr $ unLoc ty) (parseTypeToComplexType $ unLoc ty))
             , sumTypes = []
             }
@@ -441,10 +484,15 @@ parseTypeToComplexType typ = case typ of
             bodyType = parseTypeToComplexType $ unLoc body
         in ForallType binders bodyType
     
-    HsQualTy _ mContext body -> 
-        let contextTypes = case mContext of
-                            Nothing -> []
-                            Just (L _ ctx) -> map (parseTypeToComplexType . unLoc) ctx
+    HsQualTy _ mContext body ->
+        let contextTypes =
+#if __GLASGOW_HASKELL__ >= 906
+                            let L _ ctx = mContext in map (parseTypeToComplexType . unLoc) ctx
+#else
+                            case mContext of
+                                Nothing -> []
+                                Just (L _ ctx) -> map (parseTypeToComplexType . unLoc) ctx
+#endif
             bodyType = parseTypeToComplexType $ unLoc body
         in QualType contextTypes bodyType
     
@@ -472,13 +520,17 @@ parseTypeToComplexType typ = case typ of
     
     HsSumTy _ types ->
         TupleType (map (parseTypeToComplexType . unLoc) types)
-    
+
+#if __GLASGOW_HASKELL__ >= 906
+    HsOpTy _ _ ty1 op ty2 ->
+#else
     HsOpTy _ ty1 op ty2 ->
+#endif
         let left = parseTypeToComplexType $ unLoc ty1
             right = parseTypeToComplexType $ unLoc ty2
             opComp = AtomicType $ extractTypeComponent $ convertLIdP op
         in AppType opComp [left, right]
-    
+
     HsParTy _ ty ->
         parseTypeToComplexType (unLoc ty)
     
@@ -491,11 +543,20 @@ parseTypeToComplexType typ = case typ of
     HsKindSig _ ty kind ->
         KindSigType (parseTypeToComplexType $ unLoc ty) (parseTypeToComplexType $ unLoc kind)
     
+#if __GLASGOW_HASKELL__ >= 906
+    HsSpliceTy _ _ ->
+        UnknownType $ pack "Splice"
+#else
     HsSpliceTy _ splice ->
         UnknownType $ pack $ "Splice: " ++ showSDocUnsafe (ppr splice)
+#endif
     
     HsDocTy _ ty (L _ doc) ->
+#if __GLASGOW_HASKELL__ >= 906
+        DocType (parseTypeToComplexType $ unLoc ty) (renderHsDocString (hsDocString doc))
+#else
         DocType (parseTypeToComplexType $ unLoc ty) (unpackHDS doc)
+#endif
     
     HsBangTy _ _ ty ->
         BangType (parseTypeToComplexType $ unLoc ty)
@@ -576,8 +637,13 @@ parseTypeToComplexType typ = case typ of
     HsKindSig _ ty kind ->
         KindSigType (parseTypeToComplexType $ unLoc ty) (parseTypeToComplexType $ unLoc kind)
     
+#if __GLASGOW_HASKELL__ >= 906
+    HsSpliceTy _ _ ->
+        UnknownType $ pack "Splice"
+#else
     HsSpliceTy _ splice ->
         UnknownType $ pack $ "Splice: " ++ showSDocUnsafe (ppr splice)
+#endif
     
 #if __GLASGOW_HASKELL__ >= 810
     HsDocTy _ ty doc ->
@@ -920,7 +986,11 @@ dataConToDataConInfo dflags dc = do
             -- Normal case: build field map with real labels
             Map.fromList <$> zipWithM (\l t -> do
                     structType <- typeToStructuredTypeRep dflags (scaledThing t)
+#if __GLASGOW_HASKELL__ >= 906
+                    return (unpackFS (let FieldLabelString fs = flLabel l in fs), structType)
+#else
                     return (unpackFS (flLabel l), structType)
+#endif
                 ) fieldLabels fieldTypes
         else
             -- For non-record constructors, we still need to capture the arguments

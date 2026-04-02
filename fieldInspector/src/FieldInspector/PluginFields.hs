@@ -31,6 +31,9 @@ import GHC.Unit.Module.ModGuts
 import GHC.Types.Name.Reader
 import GHC.Types.Id
 import GHC.Data.FastString
+#if __GLASGOW_HASKELL__ >= 906
+import GHC.Core.Opt.Pipeline.Types (CoreToDo(..))
+#endif
 
 #else
 import CoreMonad (CoreM, CoreToDo (CoreDoPluginPass), liftIO)
@@ -332,7 +335,11 @@ getAllTypeManipulations binds = do
            Right x -> (Right . map (T.pack . showSDocUnsafe . ppr)) x
       where
         extractField :: HsRecUpdField GhcTc -> FieldRep
+#if __GLASGOW_HASKELL__ >= 906
+        extractField (HsFieldBind{hfbLHS = lbl, hfbRHS = expr, hfbPun = pun}) =
+#else
         extractField (HsRecField{hsRecFieldLbl = lbl, hsRecFieldArg = expr, hsRecPun = pun}) =
+#endif
             if pun
                 then (FieldRep (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ inferFieldTypeAFieldOcc lbl))
                 else (FieldRep (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ showSDocUnsafe $ ppr (unLoc expr)) (T.pack $ inferFieldTypeAFieldOcc lbl))
@@ -352,20 +359,30 @@ getAllTypeManipulations binds = do
         Left $ map extractField fields
       where
         extractField :: LHsRecField GhcTc (LHsExpr GhcTc) -> FieldRep
+#if __GLASGOW_HASKELL__ >= 906
+        extractField (L _ (HsFieldBind{hfbLHS = lbl, hfbRHS = expr, hfbPun = pun})) =
+#else
         extractField (L _ (HsRecField{hsRecFieldLbl = lbl, hsRecFieldArg = expr, hsRecPun = pun})) =
+#endif
             if pun
                 then (FieldRep (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ inferFieldTypeFieldOcc lbl))
                 else (FieldRep (T.pack $ showSDocUnsafe $ ppr lbl) (T.pack $ showSDocUnsafe $ ppr $ unLoc expr) (T.pack $ inferFieldTypeFieldOcc lbl))
 
     getFunctionName :: LHsBindLR GhcTc GhcTc -> [Text]
-#if __GLASGOW_HASKELL__ >= 900
+#if __GLASGOW_HASKELL__ >= 906
+    getFunctionName (L _ x@(FunBind fun_ext id matches)) = [T.pack $ nameStableString $ getName id]
+#elif __GLASGOW_HASKELL__ >= 900
     getFunctionName (L _ x@(FunBind fun_ext id matches _)) = [T.pack $ nameStableString $ getName id]
 #else
     getFunctionName (L _ x@(FunBind fun_ext id matches _ _)) = [T.pack $ nameStableString $ getName id]
 #endif
     getFunctionName (L _ (VarBind{var_id = var, var_rhs = expr})) = [T.pack $ nameStableString $ getName var]
     getFunctionName (L _ (PatBind{pat_lhs = pat, pat_rhs = expr})) = [""]
+#if __GLASGOW_HASKELL__ >= 906
+    getFunctionName (L _ (XHsBindsLR AbsBinds{abs_binds = binds})) = Prelude.concatMap getFunctionName $ bagToList binds
+#else
     getFunctionName (L _ (AbsBinds{abs_binds = binds})) = Prelude.concatMap getFunctionName $ bagToList binds
+#endif
 
 processPat :: LPat GhcTc -> [(Name, Maybe Text)]
 processPat (L _ pat) = case pat of
@@ -375,7 +392,11 @@ processPat (L _ pat) = case pat of
     ConPatIn _ details -> processDetails details
 #endif
     VarPat _ x@(L _ var) -> [(varName var, Just $ T.pack $ showSDocUnsafe $ ppr $ getLoc $ x)]
+#if __GLASGOW_HASKELL__ >= 906
+    ParPat _ _ pat' _ -> processPat pat'
+#else
     ParPat _ pat' -> processPat pat'
+#endif
     _ -> []
 
 processDetails :: HsConPatDetails GhcTc -> [(Name, Maybe Text)]
@@ -388,7 +409,11 @@ processDetails (InfixCon arg1 arg2) = processPat arg1 <> processPat arg2
 processDetails (RecCon rec) = Prelude.concatMap processPatField (rec_flds rec)
 
 processPatField :: LHsRecField GhcTc (LPat GhcTc) -> [(Name, Maybe Text)]
+#if __GLASGOW_HASKELL__ >= 906
+processPatField (L _ HsFieldBind{hfbRHS = arg}) = processPat arg
+#else
 processPatField (L _ HsRecField{hsRecFieldArg = arg}) = processPat arg
+#endif
 
 #if __GLASGOW_HASKELL__ >= 900
 getFilePath :: SrcSpan -> String

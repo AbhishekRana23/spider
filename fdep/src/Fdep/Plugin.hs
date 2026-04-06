@@ -7,8 +7,8 @@
 
 module Fdep.Plugin (plugin,collectDecls) where
 
-import Socket
--- import Control.Concurrent ( forkIO )
+import Data.Bool (bool)
+import Control.Concurrent
 import Control.Exception (SomeException, try)
 import Control.Monad (void, when)
 import Control.Reference (biplateRef, (^?))
@@ -18,9 +18,11 @@ import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Lazy as BL
 import Data.Data (toConstr)
 import Data.Generics.Uniplate.Data (childrenBi) -- immediate typed children; avoids O(n^2) in catch-all
+import Data.IORef
 import Data.List.Extra (splitOn,nub)
 import qualified Data.Map as Map
 import Data.Maybe
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -28,6 +30,8 @@ import Data.Time ( diffUTCTime, getCurrentTime )
 import Fdep.Types
 import Prelude hiding (id, writeFile,span)
 import qualified Data.List.Extra as Data.List
+import qualified Prelude as P
+import Socket
 import System.Environment (lookupEnv)
 import GHC.IO (unsafePerformIO)
 #if __GLASGOW_HASKELL__ >= 900
@@ -55,6 +59,9 @@ import GHC.Core.Opt.Monad
 import GHC.Unit.Module.ModGuts 
 import GHC.Data.FastString
 import GHC.Core.Opt.Pipeline.Types (CoreToDo (..))
+import GHC.Data.Graph.Directed (flattenSCCs)
+import GHC.Tc.Utils.Monad (getTopEnv)
+import GHC.Unit.Module.Graph (moduleGraphNodeModule)
 #if __GLASGOW_HASKELL__ >= 906
 import GHC.Types.PkgQual
 #endif
@@ -63,6 +70,7 @@ import CoreMonad
 import CoreSyn
 import TyCoRep
 import DataCon
+import Digraph (flattenSCCs)
 import qualified Data.HashMap.Strict as HM
 import Bag (bagToList)
 import DynFlags ()
@@ -71,6 +79,7 @@ import TcType
 import BasicTypes
 import GhcPlugins hiding ((<>),tyConsOfType,tyConsOfType)
 import Outputable ()
+import TcRnMonad (getTopEnv)
 import TcRnTypes (TcGblEnv (..), TcM)
 #endif
 
@@ -442,6 +451,10 @@ filterList =
     , "fromXml"
     ]
 
+{-# NOINLINE globalCompletionState #-}
+globalCompletionState :: IORef (Set.Set String, Int)
+globalCompletionState = unsafePerformIO $ newIORef (Set.empty, 0)
+
 fDep :: [CommandLineOption] -> ModSummary -> TcGblEnv -> TcM TcGblEnv
 fDep opts modSummary tcEnv = do
     let cliOptions = case opts of
@@ -450,20 +463,64 @@ fDep opts modSummary tcEnv = do
                                 case A.decode $ BL.fromStrict $ encodeUtf8 $ T.pack local of
                                     Just (val :: CliOptions) -> val
                                     Nothing -> defaultCliOptions
-    when (shouldGenerateFdep) $
-        liftIO $ do
-            let prefixPath = path cliOptions
-                moduleName' = moduleNameString $ moduleName $ ms_mod modSummary
-                modulePath = prefixPath <> msHsFilePath modSummary
-                wsPath = modulePath <> ".json"
-            let pathStr = (Data.List.intercalate "/" . reverse . tail . reverse . splitOn "/") modulePath
-            when (shouldLog || Fdep.Types.log cliOptions) $ print ("generating dependancy for module: " <> moduleName' <> " at path: " <> pathStr)
-            t1 <- getCurrentTime
-            let socketPathToUse = fromMaybe (path cliOptions) fdepSocketPath
-            sendPathPerformAction wsPath socketPathToUse (\sock -> void $ mapM (loopOverLHsBindLR cliOptions sock Nothing (T.pack wsPath)) (bagToList $ tcg_binds tcEnv))
-            t2 <- getCurrentTime
-            when (shouldLog || Fdep.Types.log cliOptions) $ print ("generated dependancy for module: " <> moduleName' <> " at path: " <> pathStr <> " total-timetaken: " <> show (diffUTCTime t2 t1))
+    hscEnv <- getTopEnv
+    let moduleGraph = hsc_mod_graph hscEnv
+        allSortedNodes = flattenSCCs $ topSortModuleGraph True moduleGraph Nothing
+#if __GLASGOW_HASKELL__ >= 900
+        sortedModules = mapMaybe (fmap moduleNameString . moduleGraphNodeModule) allSortedNodes
+#else
+        sortedModules = map (moduleNameString . ms_mod_name) allSortedNodes
+#endif
+        totalModules = length sortedModules
+        currentModuleName = moduleNameString $ moduleName $ ms_mod modSummary
+        isLastModule = case lastMaybe sortedModules of
+            Just lastMod -> lastMod == currentModuleName
+            Nothing -> False
+    when (shouldGenerateFdep) $ do
+        liftIO $ atomicModifyIORef' globalCompletionState $ \(completed, total) ->
+            if total == 0 then ((completed, totalModules), ()) else ((completed, total), ())
+        if isLastModule then
+            liftIO $ do
+                processModule cliOptions modSummary tcEnv
+                atomicModifyIORef' globalCompletionState $ \(completed, total) ->
+                    ((Set.insert currentModuleName completed, total), ())
+                waitForAllModules totalModules
+                writeIORef globalCompletionState (Set.empty, 0)
+        else
+            liftIO $ (bool P.id (void . forkIO) shouldForkPerFile) $ do
+                processModule cliOptions modSummary tcEnv
+                atomicModifyIORef' globalCompletionState $ \(completed, total) ->
+                    ((Set.insert currentModuleName completed, total), ())
     return tcEnv
+
+waitForAllModules :: Int -> IO ()
+waitForAllModules expectedTotal = do
+    (completed, _) <- readIORef globalCompletionState
+    let completedCount = Set.size completed
+    if completedCount >= expectedTotal
+        then do
+            print $ "All " <> show expectedTotal <> " modules completed!"
+            return ()
+        else do
+            threadDelay 200000  -- Wait 200ms
+            waitForAllModules expectedTotal
+
+processModule :: CliOptions -> ModSummary -> TcGblEnv -> IO ()
+processModule cliOptions modSummary tcEnv = do
+    let prefixPath = path cliOptions
+        moduleName' = moduleNameString $ moduleName $ ms_mod modSummary
+        modulePath = prefixPath <> msHsFilePath modSummary
+        wsPath = modulePath <> ".json"
+        pathStr = (Data.List.intercalate "/" . reverse . tail . reverse . splitOn "/") modulePath
+    when (shouldLog || Fdep.Types.log cliOptions) $
+        print ("generating dependancy for module: " <> moduleName' <> " at path: " <> pathStr)
+    t1 <- getCurrentTime
+    let socketPathToUse = fromMaybe (path cliOptions) fdepSocketPath
+    sendPathPerformAction wsPath socketPathToUse (\sock ->
+        void $ mapM (loopOverLHsBindLR cliOptions sock Nothing (T.pack wsPath)) (bagToList $ tcg_binds tcEnv))
+    t2 <- getCurrentTime
+    when (shouldLog || Fdep.Types.log cliOptions) $
+        print ("generated dependancy for module: " <> moduleName' <> " at path: " <> pathStr <> " total-timetaken: " <> show (diffUTCTime t2 t1))
 
 transformFromNameStableString :: (Maybe Text, Maybe Text, Maybe Text, [Text]) -> Maybe FunctionInfo
 transformFromNameStableString (Just str, Just loc, _type, args) =
@@ -477,6 +534,10 @@ transformFromNameStableString (_,_,_,_) = Nothing
 headMaybe :: [a] -> Maybe a
 headMaybe [] = Nothing
 headMaybe (x:_) = Just x
+
+lastMaybe :: [a] -> Maybe a
+lastMaybe [] = Nothing
+lastMaybe xs = Just (last xs)
 
 tail' [] = []
 tail' [x] = []

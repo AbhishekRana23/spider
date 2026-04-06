@@ -9,6 +9,7 @@ module Fdep.Plugin (plugin,collectDecls) where
 
 import Data.Bool (bool)
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Exception (SomeException, try)
 import Control.Monad (void, when)
 import Control.Reference (biplateRef, (^?))
@@ -18,11 +19,9 @@ import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Lazy as BL
 import Data.Data (toConstr)
 import Data.Generics.Uniplate.Data (childrenBi) -- immediate typed children; avoids O(n^2) in catch-all
-import Data.IORef
 import Data.List.Extra (splitOn,nub)
 import qualified Data.Map as Map
 import Data.Maybe
-import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -452,8 +451,8 @@ filterList =
     ]
 
 {-# NOINLINE globalCompletionState #-}
-globalCompletionState :: IORef (Set.Set String, Int)
-globalCompletionState = unsafePerformIO $ newIORef (Set.empty, 0)
+globalCompletionState :: TVar Int
+globalCompletionState = unsafePerformIO $ newTVarIO 0
 
 fDep :: [CommandLineOption] -> ModSummary -> TcGblEnv -> TcM TcGblEnv
 fDep opts modSummary tcEnv = do
@@ -477,33 +476,24 @@ fDep opts modSummary tcEnv = do
             Just lastMod -> lastMod == currentModuleName
             Nothing -> False
     when (shouldGenerateFdep) $ do
-        liftIO $ atomicModifyIORef' globalCompletionState $ \(completed, total) ->
-            if total == 0 then ((completed, totalModules), ()) else ((completed, total), ())
         if isLastModule then
             liftIO $ do
                 processModule cliOptions modSummary tcEnv
-                atomicModifyIORef' globalCompletionState $ \(completed, total) ->
-                    ((Set.insert currentModuleName completed, total), ())
+                atomically $ modifyTVar' globalCompletionState (+1)
                 waitForAllModules totalModules
-                writeIORef globalCompletionState (Set.empty, 0)
+                atomically $ writeTVar globalCompletionState 0
         else
             liftIO $ (bool P.id (void . forkIO) shouldForkPerFile) $ do
                 processModule cliOptions modSummary tcEnv
-                atomicModifyIORef' globalCompletionState $ \(completed, total) ->
-                    ((Set.insert currentModuleName completed, total), ())
+                atomically $ modifyTVar' globalCompletionState (+1)
     return tcEnv
 
 waitForAllModules :: Int -> IO ()
 waitForAllModules expectedTotal = do
-    (completed, _) <- readIORef globalCompletionState
-    let completedCount = Set.size completed
-    if completedCount >= expectedTotal
-        then do
-            print $ "All " <> show expectedTotal <> " modules completed!"
-            return ()
-        else do
-            threadDelay 200000  -- Wait 200ms
-            waitForAllModules expectedTotal
+    atomically $ do
+        completed <- readTVar globalCompletionState
+        check (completed >= expectedTotal)
+    print $ "All " <> show expectedTotal <> " modules completed!"
 
 processModule :: CliOptions -> ModSummary -> TcGblEnv -> IO ()
 processModule cliOptions modSummary tcEnv = do
